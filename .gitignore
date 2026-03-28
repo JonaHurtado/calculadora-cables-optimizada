@@ -1,0 +1,29 @@
+# Python related
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Streamlit related
+# .streamlit/ is now included because the user explicitly asked for it
+! .streamlit/
+! .streamlit/config.toml
+! .streamlit/secrets.toml
+
+# Local temp folders in this project
+_Base code/
+_Excel Input/
+_Excel Output/
+_Excel Referencia/
+_notas/
+scripts_temp/
+tests_volt_x/
+test_cbr_el_plano.py
+
+# Excel files
+*.xlsx
+*.xls
