@@ -18,7 +18,7 @@ from domain.physics import get_detailed_electrical_params
 from data.repository import CableRepository
 from core.rules import IntraLevelRule, ParentChildSubgroupRule, LocalSubgroupRule, RuleParser
 from core.strategies import BFTBStrategy
-from core.phase_e import MPPTAllocator
+from core.phase_e import MPPTAllocator, StandaloneMPPTAllocator
 from services.optimizer_engine import OptimizerEngine
 
 
@@ -310,6 +310,45 @@ def generate_excel_template():
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_template.to_excel(writer, index=False, sheet_name='Plantilla_VoltX')
+    return output.getvalue()
+
+
+def generate_phase_e_template() -> bytes:
+    """
+    Genera la plantilla Excel para el modo 'Solo Fase E'.
+
+    Columnas requeridas:
+        - Codigo_Circuito : Identificador del circuito/string.
+          El nivel jerárquico se infiere automáticamente del código:
+          'INV01' = Nivel 1, 'INV01-S01' = Nivel 2, 'INV01-S01-X' = Nivel 3.
+        - V_final  : Tensión FINAL en bornes del inversor en Voltios (V).
+          Es la tensión ya calculada = V_nominal - Caída_de_tensión.
+
+    Returns:
+        Bytes del archivo Excel generado en memoria.
+    """
+    df_tpl = pd.DataFrame({
+        "Codigo_Circuito": [
+            # Nivel 1 (1 segmento)
+            "INV01",
+            "INV02",
+            # Nivel 2 (2 segmentos) ← strings típicos de un parque FV
+            "INV01-S01", "INV01-S02", "INV01-S03",
+            "INV01-S04", "INV01-S05",
+            "INV02-S01", "INV02-S02", "INV02-S03",
+        ],
+        "V_final": [
+            # Nivel 1
+            795.00, 794.50,
+            # Nivel 2
+            787.50, 788.20, 786.90,
+            789.10, 787.80,
+            788.40, 786.60, 788.00,
+        ],
+    })
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_tpl.to_excel(writer, index=False, sheet_name='PlantillaFaseE')
     return output.getvalue()
 
 # Format guide
@@ -722,216 +761,449 @@ with col_e2:
 with col_e3:
     pe_n_inputs = st.number_input("Entradas por MPPT", min_value=1, value=5)
 
-# --- 8. EXECUTION AND RESULTS ---
-st.header("7. Resultados")
+# ─────────────────────────────────────────────────────────────────────────────
+# --- 8. MODO DE EJECUCIÓN: Tabs ---
+# Tab 1 → Flujo completo (sin cambios)
+# Tab 2 → Ejecución aislada Solo Fase E
+# ─────────────────────────────────────────────────────────────────────────────
 
-if st.button("🚀 CALCULAR OPTIMIZACIÓN", type="primary"):
-    if uploaded_file is None or not st.session_state['rules_list']:
-        st.error("⚠️ Faltan datos: Por favor carga el Excel y define al menos una regla.")
-    else:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_path = tmp_file.name
-        
-        try:
-            # A. Prepare Context
-            final_systems = {}
-            for lvl, ui_val in config_niveles["systems_ui"].items():
-                if "AC Trifásica" in ui_val:
-                    final_systems[lvl] = "AC_TRI"
-                elif "AC Monofásica" in ui_val:
-                    final_systems[lvl] = "AC_MONO"
-                elif "DC" in ui_val:
-                    final_systems[lvl] = "DC_MONO"
+tab1, tab2 = st.tabs(["⚡ Flujo Completo (Pasos 1-6)", "🔌 Solo Fase E (MPPTs)"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — FLUJO COMPLETO (código original sin modificar)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab1:
+    st.header("7. Resultados")
+
+    if st.button("🚀 CALCULAR OPTIMIZACIÓN", type="primary", key="btn_full_run"):
+        if uploaded_file is None or not st.session_state['rules_list']:
+            st.error("⚠️ Faltan datos: Por favor carga el Excel y define al menos una regla.")
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                tmp_path = tmp_file.name
             
-            final_rules = []
-            for r in st.session_state['rules_list']:
-                if r['type'] == 'IntraLevelRule':
-                    final_rules.append(IntraLevelRule(int(r['level']), r['metric'], float(r['limit'])))
-                elif r['type'] == 'ParentChildSubgroupRule':
-                    final_rules.append(
-                        ParentChildSubgroupRule(int(r['parent_level']), int(r['child_level']), r['child_metric'],
-                                                float(r['limit'])))
-                elif r['type'] == 'LocalSubgroupRule':
-                    final_rules.append(
-                        LocalSubgroupRule(int(r['parent_level']), int(r['child_level']), r['child_metric'],
-                                          float(r['limit'])))
-            
-            # Update catalog with edited prices
-            for index, row in edited_prices_df.iterrows():
-                s = row["Sección (mm²)"]
-                p_cu = row["Cobre (€/m)"]
-                p_al = row["Aluminio (€/m)"]
-                if s in raw_catalog.copper:
-                    raw_catalog.copper[s].price = p_cu
-                if s in raw_catalog.aluminum:
-                    raw_catalog.aluminum[s].price = p_al
-            
-            ctx = OptimizationContext(
-                temp_global,
-                config_niveles["voltages"],
-                final_systems,
-                config_niveles["factors"],
-                config_niveles["frequencies"],
-                config_niveles["disposiciones"],
-                config_niveles["allowed_sections"],
-                config_niveles["allow_double"],
-                None, # derating_factor (unused in context, kept for compatibility if needed)
-                config_niveles["level_ampacities"],
-                config_niveles["level_t_ref"],
-                config_niveles["level_t_max"],
-                final_rules,
-                raw_catalog
-            )
-            
-            if st.session_state.get('parsed_advanced_rules'):
-                # HAL-R04: Validate that advanced rules reference valid levels
-                for adv_rule in st.session_state['parsed_advanced_rules']:
-                    rule_levels = []
-                    if hasattr(adv_rule, 'level'):
-                        rule_levels.append(adv_rule.level)
-                    if hasattr(adv_rule, 'parent_level'):
-                        rule_levels.append(adv_rule.parent_level)
-                    if hasattr(adv_rule, 'child_level'):
-                        rule_levels.append(adv_rule.child_level)
-                    for rl in rule_levels:
-                        if rl > num_levels:
-                            st.warning(f"⚠️ Regla avanzada referencia Nivel {rl}, pero solo hay {num_levels} niveles definidos.")
-                ctx.rules.extend(st.session_state['parsed_advanced_rules'])
-            
-            # B. Execution with st.status for clear user feedback
-            results = {}
-            
-            with st.status("🔄 Ejecutando optimización...", expanded=True) as status:
-                status.update(label="📂 Cargando y validando datos del Excel...")
-                st.write("Construyendo árbol de circuitos...")
+            try:
+                # A. Prepare Context
+                final_systems = {}
+                for lvl, ui_val in config_niveles["systems_ui"].items():
+                    if "AC Trifásica" in ui_val:
+                        final_systems[lvl] = "AC_TRI"
+                    elif "AC Monofásica" in ui_val:
+                        final_systems[lvl] = "AC_MONO"
+                    elif "DC" in ui_val:
+                        final_systems[lvl] = "DC_MONO"
                 
-                strategy = BFTBStrategy(repository)
-                engine = OptimizerEngine(
-                    filepath=tmp_path,
-                    context=ctx,
-                    repository=repository,
-                    strategy=strategy
+                final_rules = []
+                for r in st.session_state['rules_list']:
+                    if r['type'] == 'IntraLevelRule':
+                        final_rules.append(IntraLevelRule(int(r['level']), r['metric'], float(r['limit'])))
+                    elif r['type'] == 'ParentChildSubgroupRule':
+                        final_rules.append(
+                            ParentChildSubgroupRule(int(r['parent_level']), int(r['child_level']), r['child_metric'],
+                                                    float(r['limit'])))
+                    elif r['type'] == 'LocalSubgroupRule':
+                        final_rules.append(
+                            LocalSubgroupRule(int(r['parent_level']), int(r['child_level']), r['child_metric'],
+                                              float(r['limit'])))
+                
+                # Update catalog with edited prices
+                for index, row in edited_prices_df.iterrows():
+                    s = row["Sección (mm²)"]
+                    p_cu = row["Cobre (€/m)"]
+                    p_al = row["Aluminio (€/m)"]
+                    if s in raw_catalog.copper:
+                        raw_catalog.copper[s].price = p_cu
+                    if s in raw_catalog.aluminum:
+                        raw_catalog.aluminum[s].price = p_al
+                
+                ctx = OptimizationContext(
+                    temp_global,
+                    config_niveles["voltages"],
+                    final_systems,
+                    config_niveles["factors"],
+                    config_niveles["frequencies"],
+                    config_niveles["disposiciones"],
+                    config_niveles["allowed_sections"],
+                    config_niveles["allow_double"],
+                    None, # derating_factor (unused in context, kept for compatibility if needed)
+                    config_niveles["level_ampacities"],
+                    config_niveles["level_t_ref"],
+                    config_niveles["level_t_max"],
+                    final_rules,
+                    raw_catalog
                 )
                 
-                if not engine.load_and_validate():
-                    status.update(label="❌ Error al cargar datos", state="error", expanded=True)
-                    st.error("No se pudieron cargar o validar los datos del Excel.")
-                    results["v2"] = (None, None, 0.0)
+                if st.session_state.get('parsed_advanced_rules'):
+                    # HAL-R04: Validate that advanced rules reference valid levels
+                    for adv_rule in st.session_state['parsed_advanced_rules']:
+                        rule_levels = []
+                        if hasattr(adv_rule, 'level'):
+                            rule_levels.append(adv_rule.level)
+                        if hasattr(adv_rule, 'parent_level'):
+                            rule_levels.append(adv_rule.parent_level)
+                        if hasattr(adv_rule, 'child_level'):
+                            rule_levels.append(adv_rule.child_level)
+                        for rl in rule_levels:
+                            if rl > num_levels:
+                                st.warning(f"⚠️ Regla avanzada referencia Nivel {rl}, pero solo hay {num_levels} niveles definidos.")
+                    ctx.rules.extend(st.session_state['parsed_advanced_rules'])
+                
+                # B. Execution with st.status for clear user feedback
+                results = {}
+                
+                with st.status("🔄 Ejecutando optimización...", expanded=True) as status:
+                    status.update(label="📂 Cargando y validando datos del Excel...")
+                    st.write("Construyendo árbol de circuitos...")
+                    
+                    strategy = BFTBStrategy(repository)
+                    engine = OptimizerEngine(
+                        filepath=tmp_path,
+                        context=ctx,
+                        repository=repository,
+                        strategy=strategy
+                    )
+                    
+                    if not engine.load_and_validate():
+                        status.update(label="❌ Error al cargar datos", state="error", expanded=True)
+                        st.error("No se pudieron cargar o validar los datos del Excel.")
+                        results["v2"] = (None, None, 0.0)
+                    else:
+                        status.update(label="⚡ Ejecutando algoritmo BFTB...")
+                        st.write(f"Optimizando {len(engine.circuits)} circuitos...")
+                        
+                        start_time = time.time()
+                        result = engine.solve()
+                        elapsed_time = time.time() - start_time
+                        
+                        results["v2"] = (engine, result, elapsed_time)
+                        status.update(label="✅ Optimización completada", state="complete", expanded=False)
+                
+                # C. Process Results
+                if results["v2"][1]:
+                    engine_v2, result_v2, time_v2 = results["v2"]
+                    cost_v2 = calculate_real_project_cost(result_v2.solution_map, engine_v2.circuits, ctx, repository)
+                    
+                    # SAVE TO SESSION STATE (persists across reruns)
+                    # NOTE (HAL-S01): We store full engine/result objects for Phase E and table generation.
+                    # These are non-serializable and can be large in multi-user deployments.
+                    # Acceptable for single-user/local use; consider extracting only needed data if scaling.
+                    st.session_state['last_engine'] = engine_v2
+                    st.session_state['last_result'] = result_v2
+                    st.session_state['last_context'] = ctx
+                    st.session_state['last_cost'] = cost_v2
+                    st.session_state['last_time'] = time_v2
+                    
+                    # --- AUTOMATIC PHASE E EXECUTION ---
+                    try:
+                        allocator = MPPTAllocator(engine_v2, result_v2, ctx)
+                        df_phase_e = allocator.allocate(int(pe_target_level), int(pe_n_mppts), int(pe_n_inputs))
+                        st.session_state['phase_e_data'] = df_phase_e
+                    except Exception as e_ph:
+                        st.session_state['phase_e_data'] = None
+                        st.error(f"Error en Fase E Automática: {e_ph}")
+                    
+                    # Build table data and persist in session_state
+                    phase_e_data = st.session_state.get('phase_e_data', None)
+                    data_v2 = build_table_data(engine_v2, result_v2, ctx, phase_e_data)
+                    st.session_state['last_table_data'] = data_v2
+                    
+                    # Build materials summary and persist
+                    m_v2 = generate_materials_summary(engine_v2.circuits, result_v2.solution_map, ctx)
+                    st.session_state['last_materials_summary'] = m_v2
+                    
+                    # Generate Excel in memory (BytesIO) and persist
+                    excel_buffer = io.BytesIO()
+                    out_name = f"{os.path.splitext(uploaded_file.name)[0]}_Optimizado.xlsx"
+                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                        pd.DataFrame(data_v2).to_excel(writer, sheet_name="Detalle", index=False)
+                    excel_buffer.seek(0)
+                    st.session_state['last_excel_bytes'] = excel_buffer.getvalue()
+                    st.session_state['last_excel_name'] = out_name
+                    
+                    st.session_state['optimization_done'] = True
                 else:
-                    status.update(label="⚡ Ejecutando algoritmo BFTB...")
-                    st.write(f"Optimizando {len(engine.circuits)} circuitos...")
-                    
-                    start_time = time.time()
-                    result = engine.solve()
-                    elapsed_time = time.time() - start_time
-                    
-                    results["v2"] = (engine, result, elapsed_time)
-                    status.update(label="✅ Optimización completada", state="complete", expanded=False)
-            
-            # C. Process Results
-            if results["v2"][1]:
-                engine_v2, result_v2, time_v2 = results["v2"]
-                cost_v2 = calculate_real_project_cost(result_v2.solution_map, engine_v2.circuits, ctx, repository)
-                
-                # SAVE TO SESSION STATE (persists across reruns)
-                # NOTE (HAL-S01): We store full engine/result objects for Phase E and table generation.
-                # These are non-serializable and can be large in multi-user deployments.
-                # Acceptable for single-user/local use; consider extracting only needed data if scaling.
-                st.session_state['last_engine'] = engine_v2
-                st.session_state['last_result'] = result_v2
-                st.session_state['last_context'] = ctx
-                st.session_state['last_cost'] = cost_v2
-                st.session_state['last_time'] = time_v2
-                
-                # --- AUTOMATIC PHASE E EXECUTION ---
-                try:
-                    allocator = MPPTAllocator(engine_v2, result_v2, ctx)
-                    df_phase_e = allocator.allocate(int(pe_target_level), int(pe_n_mppts), int(pe_n_inputs))
-                    st.session_state['phase_e_data'] = df_phase_e
-                except Exception as e_ph:
-                    st.session_state['phase_e_data'] = None
-                    st.error(f"Error en Fase E Automática: {e_ph}")
-                
-                # Build table data and persist in session_state
-                phase_e_data = st.session_state.get('phase_e_data', None)
-                data_v2 = build_table_data(engine_v2, result_v2, ctx, phase_e_data)
-                st.session_state['last_table_data'] = data_v2
-                
-                # Build materials summary and persist
-                m_v2 = generate_materials_summary(engine_v2.circuits, result_v2.solution_map, ctx)
-                st.session_state['last_materials_summary'] = m_v2
-                
-                # Generate Excel in memory (BytesIO) and persist
-                excel_buffer = io.BytesIO()
-                out_name = f"{os.path.splitext(uploaded_file.name)[0]}_Optimizado.xlsx"
-                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                    pd.DataFrame(data_v2).to_excel(writer, sheet_name="Detalle", index=False)
-                excel_buffer.seek(0)
-                st.session_state['last_excel_bytes'] = excel_buffer.getvalue()
-                st.session_state['last_excel_name'] = out_name
-                
-                st.session_state['optimization_done'] = True
-            else:
-                st.session_state['optimization_done'] = False
-                st.error("❌ No se encontró solución.")
-        except Exception as e:
-            st.error(f"Error: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+                    st.session_state['optimization_done'] = False
+                    st.error("❌ No se encontró solución.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
-# --- 9. PERSISTENT RESULTS DISPLAY ---
-# Results are rendered OUTSIDE the button block so they survive reruns
-if st.session_state.get('optimization_done', False):
-    st.success("✅ ¡Optimización Finalizada!")
-    
-    # KPI Metrics
-    c1, c2 = st.columns(2)
-    c1.metric("💰 Coste Total Optimizado", f"{st.session_state['last_cost']:,.2f} €")
-    c2.metric("⏱️ Tiempo de Ejecución", format_time_ms(st.session_state['last_time']))
-    
-    # Results table
-    if 'last_table_data' in st.session_state:
-        st.subheader("Detalle de Resultados")
-        st.dataframe(pd.DataFrame(st.session_state['last_table_data']), use_container_width=True)
+    # --- 9. PERSISTENT RESULTS DISPLAY ---
+    # Results are rendered OUTSIDE the button block so they survive reruns
+    if st.session_state.get('optimization_done', False):
+        st.success("✅ ¡Optimización Finalizada!")
         
-        st.subheader("📦 Resumen Materiales")
-        if 'last_materials_summary' in st.session_state:
-            for title, df in st.session_state['last_materials_summary']:
-                st.markdown(f"**{title}**")
-                st.dataframe(df, use_container_width=True)
-    
-    # Excel download (from memory buffer)
-    if 'last_excel_bytes' in st.session_state:
-        st.download_button(
-            "📥 Descargar Reporte Excel",
-            data=st.session_state['last_excel_bytes'],
-            file_name=st.session_state.get('last_excel_name', 'VoltX_Optimizado.xlsx'),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        # KPI Metrics
+        c1, c2 = st.columns(2)
+        c1.metric("💰 Coste Total Optimizado", f"{st.session_state['last_cost']:,.2f} €")
+        c2.metric("⏱️ Tiempo de Ejecución", format_time_ms(st.session_state['last_time']))
+        
+        # Results table
+        if 'last_table_data' in st.session_state:
+            st.subheader("Detalle de Resultados")
+            st.dataframe(pd.DataFrame(st.session_state['last_table_data']), use_container_width=True)
+            
+            st.subheader("📦 Resumen Materiales")
+            if 'last_materials_summary' in st.session_state:
+                for title, df in st.session_state['last_materials_summary']:
+                    st.markdown(f"**{title}**")
+                    st.dataframe(df, use_container_width=True)
+        
+        # Excel download (from memory buffer)
+        if 'last_excel_bytes' in st.session_state:
+            st.download_button(
+                "📥 Descargar Reporte Excel",
+                data=st.session_state['last_excel_bytes'],
+                file_name=st.session_state.get('last_excel_name', 'VoltX_Optimizado.xlsx'),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+    # --- 10. PHASE E: RESULTS DISPLAY (inside Tab 1) ---
+    # Automatically display results if they exist in session state
+    if 'phase_e_data' in st.session_state and st.session_state['phase_e_data'] is not None:
+        st.markdown("---")
+        st.header("8. Resultados Fase E: Asignación de MPPTs")
+        
+        df_pe = st.session_state['phase_e_data']
+        
+        if not df_pe.empty:
+            # Check for errors (with column existence check)
+            if 'Error' in df_pe.columns:
+                errors = df_pe[df_pe['Error'] != 'OK']
+                if not errors.empty:
+                    st.error(f"⚠️ Se encontraron {len(errors)} circuitos con errores de capacidad.")
+                    st.dataframe(errors, use_container_width=True)
+                else:
+                    st.success("✅ Asignación MPPT correcta (Sin errores de capacidad).")
+            else:
+                st.success("✅ Asignación MPPT completada.")
+            
+        else:
+            st.warning(f"⚠️ La Fase E se ejecutó pero no encontró circuitos para el nivel {pe_target_level}.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — SOLO FASE E (ejecución aislada, sin optimización previa)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    st.header("Ejecución Aislada: Solo Fase E (MPPTs)")
+    st.info(
+        "Este modo permite asignar MPPTs **sin ejecutar la optimización completa**. "
+        "Solo debes proporcionar un Excel con los circuitos y su caída de tensión final."
+    )
+
+    # ── Guía del formato + plantilla descargable ──────────────────────────────
+    with st.expander("📋 Ver formato del Excel de entrada requerido", expanded=True):
+        st.markdown("""
+        El archivo Excel debe contener **exactamente** las siguientes columnas:
+
+        | Columna | Tipo | Requerido | Descripción |
+        | :--- | :---: | :---: | :--- |
+        | **`Codigo_Circuito`** | `str` | ✅ Sí | ID único del circuito/string. El **nivel se infiere automáticamente** contando los segmentos separados por guión: `INV01` = Nivel 1, `INV01-S01` = Nivel 2, `INV01-S01-X` = Nivel 3. El primer segmento es el inversor padre. |
+        | **`V_final`** | `float` | ✅ Sí | **Tensión final en bornes del inversor/MPPT**, en Voltios (V). Es el valor ya calculado: `V_nominal − Caída_de_tensión`. Se usa para ordenar strings y minimizar el mismatch entre los que comparten MPPT. |
+
+        > **Ventaja:** No hace falta una columna extra de nivel. Puedes incluir circuitos de
+        > todos los niveles de tu proyecto en un mismo Excel — el selector de la interfaz
+        > filtra automáticamente los del nivel que quieras procesar.
+
+        > **Nota sobre `V_final`:** No es la caída de tensión, sino la tensión resultante.
+        > Ej: `V_nominal = 800 V`, caída = `12.5 V` → `V_final = 787.5 V`.
+        """)
+
+        col_g1, col_g2 = st.columns([2, 1])
+        with col_g1:
+            st.info("Descarga la plantilla de ejemplo para comenzar rápidamente:")
+        with col_g2:
+            st.download_button(
+                label="📄 Descargar Plantilla Fase E",
+                data=generate_phase_e_template(),
+                file_name="plantilla_solo_fase_e.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="btn_download_fase_e_template"
+            )
+
+        st.dataframe(
+            pd.DataFrame({
+                "Codigo_Circuito": ["INV01", "INV01-S01", "INV01-S02", "INV02-S01"],
+                "V_final":         [795.00,  787.50,       788.20,       786.90],
+            }),
+            hide_index=True,
+            use_container_width=True,
         )
 
-# --- 10. PHASE E: RESULTS DISPLAY ---
-# Automatically display results if they exist in session state
-if 'phase_e_data' in st.session_state and st.session_state['phase_e_data'] is not None:
     st.markdown("---")
-    st.header("8. Resultados Fase E: Asignación de MPPTs")
-    
-    df_pe = st.session_state['phase_e_data']
-    
-    if not df_pe.empty:
-        # Check for errors (with column existence check)
-        if 'Error' in df_pe.columns:
-            errors = df_pe[df_pe['Error'] != 'OK']
-            if not errors.empty:
-                st.error(f"⚠️ Se encontraron {len(errors)} circuitos con errores de capacidad.")
-                st.dataframe(errors, use_container_width=True)
-            else:
-                st.success("✅ Asignación MPPT correcta (Sin errores de capacidad).")
+
+    # ── Carga del Excel de Fase E ─────────────────────────────────────────────
+    st.subheader("1. Carga del Excel")
+    uploaded_fase_e = st.file_uploader(
+        "Sube tu archivo Excel con `Codigo_Circuito` y `V_final`",
+        type=["xlsx"],
+        key="uploader_fase_e",
+        help="El archivo debe contener las columnas 'Codigo_Circuito' y 'V_final'. El nivel se infiere del código."
+    )
+
+    # ── Configuración de Fase E Standalone ───────────────────────────────────
+    st.subheader("2. Configuración MPPT")
+    col_se1, col_se2, col_se3 = st.columns(3)
+    with col_se1:
+        se_nivel = st.number_input(
+            "Nivel de circuitos a procesar",
+            min_value=1,
+            max_value=5,
+            value=2,
+            step=1,
+            key="se_nivel",
+            help=(
+                "Selecciona el nivel jerárquico de los circuitos que quieres asignar a MPPTs. "
+                "El nivel se infiere automáticamente del código: "
+                "'INV01' = Nivel 1, 'INV01-S01' = Nivel 2, 'INV01-S01-X' = Nivel 3. "
+                "Solo se procesarán los circuitos cuyo código tenga ese número de segmentos."
+            )
+        )
+    with col_se2:
+        se_n_mppts = st.number_input(
+            "Nº MPPTs por Inversor",
+            min_value=1,
+            value=6,
+            key="se_n_mppts"
+        )
+    with col_se3:
+        se_n_inputs = st.number_input(
+            "Entradas por MPPT",
+            min_value=1,
+            value=5,
+            key="se_n_inputs"
+        )
+
+    st.markdown("---")
+
+    # ── Botón de Ejecución ────────────────────────────────────────────────────
+    st.subheader("3. Ejecutar")
+
+    if st.button("🔌 EJECUTAR SOLO FASE E", type="primary", key="btn_solo_fase_e"):
+        if uploaded_fase_e is None:
+            st.error("⚠️ Debes cargar un archivo Excel antes de ejecutar.")
         else:
-            st.success("✅ Asignación MPPT completada.")
-        
-    else:
-        st.warning(f"⚠️ La Fase E se ejecutó pero no encontró circuitos para el nivel {pe_target_level}.")
+            try:
+                # 1. Leer el Excel
+                df_input_fase_e = pd.read_excel(uploaded_fase_e)
+
+                # 2. Instanciar el allocator (valida columnas y tipos internamente)
+                allocator_standalone = StandaloneMPPTAllocator(
+                    df_input=df_input_fase_e
+                )
+
+                # 3. Ejecutar la asignación filtrando por el nivel seleccionado
+                with st.spinner("⚙️ Calculando asignación de MPPTs..."):
+                    df_resultado_se = allocator_standalone.allocate(
+                        nivel=int(se_nivel),
+                        mppts_per_inverter=int(se_n_mppts),
+                        inputs_per_mppt=int(se_n_inputs)
+                    )
+
+                # 4. Construir el Excel de salida: copia del input + columnas MPPT e Input_PV
+                #    Solo se rellena para los circuitos del nivel procesado.
+                df_enriquecido = df_input_fase_e.copy()
+
+                # Mapa código → (MPPT, Input_PV) desde el resultado
+                mppt_map = (
+                    df_resultado_se
+                    .set_index('Circuito Original')[['MPPT', 'Input_PV']]
+                    .to_dict('index')
+                )
+
+                df_enriquecido['MPPT']     = df_enriquecido['Codigo_Circuito'].map(
+                    lambda c: mppt_map.get(c, {}).get('MPPT', None)
+                )
+                df_enriquecido['Input_PV'] = df_enriquecido['Codigo_Circuito'].map(
+                    lambda c: mppt_map.get(c, {}).get('Input_PV', None)
+                )
+
+                # 5. Persistir en session_state
+                st.session_state['solo_fase_e_result']      = df_resultado_se
+                st.session_state['solo_fase_e_enriquecido'] = df_enriquecido
+                st.session_state['solo_fase_e_done']        = True
+                st.session_state['solo_fase_e_filename']    = uploaded_fase_e.name
+
+            except (ValueError, TypeError) as ve:
+                # Errores de validación del formato del Excel
+                st.session_state['solo_fase_e_done'] = False
+                st.error(f"❌ **Error de formato en el Excel:**\n\n{ve}")
+            except Exception as exc:
+                st.session_state['solo_fase_e_done'] = False
+                st.error(f"❌ Error inesperado: {exc}")
+                import traceback
+                st.code(traceback.format_exc())
+
+    # ── Resultados Fase E Standalone ──────────────────────────────────────────
+    if st.session_state.get('solo_fase_e_done', False):
+        df_se          = st.session_state['solo_fase_e_result']
+        df_enriquecido = st.session_state.get('solo_fase_e_enriquecido', df_se)
+
+        st.markdown("---")
+        st.subheader("4. Resultados: Asignación de MPPTs")
+
+        if df_se.empty:
+            st.warning("⚠️ El allocator no encontró circuitos en el archivo cargado.")
+        else:
+            # Resumen de errores de capacidad
+            if 'Error' in df_se.columns:
+                errors_se = df_se[df_se['Error'] != 'OK']
+                if not errors_se.empty:
+                    st.error(
+                        f"⚠️ {len(errors_se)} circuito(s) exceden la capacidad del inversor. "
+                        "Revisa los grupos señalados."
+                    )
+                    with st.expander("Ver circuitos con error"):
+                        st.dataframe(
+                            errors_se[['Inversor (Padre)', 'Circuito Original', 'Error']].drop_duplicates(),
+                            use_container_width=True
+                        )
+                else:
+                    st.success("✅ Asignación MPPT correcta — Sin errores de capacidad.")
+
+            # KPIs rápidos
+            n_inversores = df_se['Inversor (Padre)'].nunique()
+            n_circuitos  = df_se['Circuito Original'].nunique()
+            col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
+            col_kpi1.metric("Inversores procesados", n_inversores)
+            col_kpi2.metric("Circuitos asignados",   n_circuitos)
+            col_kpi3.metric("MPPTs configurados",    int(se_n_mppts))
+
+            # Tabla principal: Excel de entrada enriquecido con MPPT e Input_PV
+            st.caption(
+                "👇 Mismo formato que el Excel de salida: todas las filas del input "
+                "+ columnas **MPPT** e **Input_PV** en los circuitos del nivel procesado."
+            )
+            st.dataframe(df_enriquecido, use_container_width=True, hide_index=True)
+
+            # Detalle de la asignación (colapsable)
+            with st.expander("🔍 Ver tabla de asignación completa"):
+                st.dataframe(df_se, use_container_width=True, hide_index=True)
+
+            # ── Descarga del Excel de salida ──────────────────────────────────
+            # Formato: mismo que el input + columnas MPPT e Input_PV
+            # Nombre:  {nombre_original}_MPPT.xlsx
+            nombre_base = os.path.splitext(st.session_state['solo_fase_e_filename'])[0]
+            out_se_name = f"{nombre_base}_MPPT.xlsx"
+
+            excel_se_buf = io.BytesIO()
+            with pd.ExcelWriter(excel_se_buf, engine='openpyxl') as writer:
+                df_enriquecido.to_excel(writer, sheet_name="Datos_MPPT", index=False)
+            excel_se_buf.seek(0)
+
+            st.download_button(
+                label="📥 Descargar Excel con MPPTs asignados",
+                data=excel_se_buf.getvalue(),
+                file_name=out_se_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="btn_download_fase_e_result"
+            )
+            st.caption(f"📄 Archivo de salida: **{out_se_name}**")
+
