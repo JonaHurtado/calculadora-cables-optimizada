@@ -15,20 +15,20 @@ class MPPTAllocator:
         self.result = result
         self.context = context
 
-    def allocate(self, level: int, mppts_per_inverter: int, inputs_per_mppt: int) -> pd.DataFrame:
+    def allocate(self, level: int, inputs_per_mppt: List[int]) -> pd.DataFrame:
         """
         Execute the MPPT allocation process.
         
         Args:
             level: The circuit hierarchy level to optimize (e.g., 3 for strings).
-            mppts_per_inverter: Number of MPPTs available per physical inverter.
-            inputs_per_mppt: Number of inputs per MPPT.
+            inputs_per_mppt: List containing maximum capacity for each MPPT. Length is number of MPPTs.
             
         Returns:
             DataFrame with assignment results including nomenclature and voltage data.
         """
         # Configuration
-        total_inputs_per_inverter = mppts_per_inverter * inputs_per_mppt
+        mppts_per_inverter = len(inputs_per_mppt)
+        total_inputs_per_inverter = sum(inputs_per_mppt)
         
         # 1. Filter circuits by level and build working dataset
         target_circuits = []
@@ -83,22 +83,25 @@ class MPPTAllocator:
             
             # 3.3 Contiguous Block Assignment (Minimizes Mismatch)
             # Circuits are already sorted by Voltage_Inverter descending.
-            # Assign consecutive blocks to each MPPT so that strings with
-            # similar final voltages share the same tracker.
-            #   Example: 29 circuits / 6 MPPTs → 5 MPPTs×5 + 1 MPPT×4
-            mppt_buckets = {i+1: [] for i in range(mppts_per_inverter)}
+            # We determine how many circuits each MPPT should get by simulating
+            # a round-robin distribution to balance the load, respecting individual limits.
+            mppt_buckets: Dict[int, list] = {i + 1: [] for i in range(mppts_per_inverter)}
+            bucket_sizes = [0] * mppts_per_inverter
+            remaining_circuits = actual_count
             
-            base_size = actual_count // mppts_per_inverter
-            remainder = actual_count % mppts_per_inverter
+            while remaining_circuits > 0:
+                assigned_in_round = False
+                for i in range(mppts_per_inverter):
+                    if bucket_sizes[i] < inputs_per_mppt[i] and remaining_circuits > 0:
+                        bucket_sizes[i] += 1
+                        remaining_circuits -= 1
+                        assigned_in_round = True
+                if not assigned_in_round:
+                    break
             
             cursor = 0
             for mppt_num in range(1, mppts_per_inverter + 1):
-                # First 'remainder' MPPTs get one extra circuit
-                bucket_size = base_size + (1 if mppt_num <= remainder else 0)
-                # Clamp to inputs_per_mppt capacity
-                bucket_size = min(bucket_size, inputs_per_mppt)
-                
-                for i in range(bucket_size):
+                for _ in range(bucket_sizes[mppt_num - 1]):
                     if cursor < actual_count:
                         mppt_buckets[mppt_num].append(group[cursor])
                         cursor += 1
@@ -107,12 +110,10 @@ class MPPTAllocator:
             for mppt_num in range(1, mppts_per_inverter + 1):
                 items = mppt_buckets[mppt_num]
                 
+                prev_capacities = sum(inputs_per_mppt[:mppt_num-1])
                 for slot_idx, item in enumerate(items): # slot_idx 0-based
                     # Global input index (1-based)
-                    # "Respetar los huecos... en la numeración" -> Assume Fixed Slots.
-                    # PV01 is MPPT1-Input1. PV05 is MPPT1-Input5. PV06 is MPPT2-Input1.
-                    
-                    global_pv_num = (mppt_num - 1) * inputs_per_mppt + (slot_idx + 1)
+                    global_pv_num = prev_capacities + (slot_idx + 1)
                     pv_name = f"PV{global_pv_num:02d}"
                     new_code = f"{item['Circuit_Code']}-{pv_name}"
                     
@@ -128,6 +129,23 @@ class MPPTAllocator:
                         'Error': error_msg
                     }
                     final_rows.append(row)
+                    
+            # 3.5 Handle unassigned circuits (exceeding capacity)
+            while cursor < actual_count:
+                item = group[cursor]
+                row = {
+                    'Inversor (Padre)': parent_id,
+                    'MPPT': None,
+                    'Input_PV': 'UNASSIGNED',
+                    'Circuito Original': item['Circuit_Code'],
+                    'Nuevo Código': f"{item['Circuit_Code']}-UNASSIGNED",
+                    'Voltage Base (V)': item['Voltage_Base'],
+                    'Voltage Drop (V)': round(item['Voltage_Drop'], 4),
+                    'Voltage Inverter (V)': round(item['Voltage_Inverter'], 4),
+                    'Error': error_msg
+                }
+                final_rows.append(row)
+                cursor += 1
 
         return pd.DataFrame(final_rows)
 
@@ -295,7 +313,7 @@ class StandaloneMPPTAllocator:
     # Ejecución Principal
     # ------------------------------------------------------------------
 
-    def allocate(self, nivel: int, mppts_per_inverter: int, inputs_per_mppt: int) -> pd.DataFrame:
+    def allocate(self, nivel: int, inputs_per_mppt: List[int]) -> pd.DataFrame:
         """
         Ejecuta la asignación de MPPTs sobre los circuitos del nivel indicado.
 
@@ -305,13 +323,12 @@ class StandaloneMPPTAllocator:
           2. Filtra el DataFrame para quedarse solo con las filas de ``nivel``.
           3. Agrupa por inversor (padre del código) y ordena cada grupo por
              ``V_final`` descendente para minimizar el mismatch de tensión.
-          4. Asigna en bloques contiguos a cada MPPT, respetando la capacidad.
+          4. Asigna en bloques contiguos a cada MPPT, respetando la capacidad particular de cada uno.
 
         Args:
             nivel:              Nivel jerárquico a procesar (ej. 2 para strings
                                 con códigos tipo 'INV01-S01').
-            mppts_per_inverter: Número de MPPTs disponibles por inversor físico.
-            inputs_per_mppt:    Número máximo de entradas (strings) por MPPT.
+            inputs_per_mppt:    Lista con el número máximo de entradas por cada MPPT.
 
         Returns:
             DataFrame con las siguientes columnas:
@@ -327,7 +344,8 @@ class StandaloneMPPTAllocator:
         Raises:
             ValueError: Si no hay circuitos para el nivel seleccionado.
         """
-        total_inputs_per_inverter = mppts_per_inverter * inputs_per_mppt
+        mppts_per_inverter = len(inputs_per_mppt)
+        total_inputs_per_inverter = sum(inputs_per_mppt)
 
         # 1. Calcular el nivel de cada fila a partir del código
         df = self.df_input[self.REQUIRED_COLUMNS].copy()
@@ -364,24 +382,33 @@ class StandaloneMPPTAllocator:
             # 3.2 Ordenar por V_final descendente (strings con más tensión primero)
             group.sort(key=lambda x: x["V_final"], reverse=True)
 
-            # 3.3 Asignación de bloques contiguos
+            # 3.3 Asignación de bloques contiguos respetando capacidad y balanceando
             mppt_buckets: Dict[int, list] = {i + 1: [] for i in range(mppts_per_inverter)}
-            base_size = actual_count // mppts_per_inverter
-            remainder = actual_count % mppts_per_inverter
-            cursor = 0
+            bucket_sizes = [0] * mppts_per_inverter
+            remaining_circuits = actual_count
 
+            while remaining_circuits > 0:
+                assigned_in_round = False
+                for i in range(mppts_per_inverter):
+                    if bucket_sizes[i] < inputs_per_mppt[i] and remaining_circuits > 0:
+                        bucket_sizes[i] += 1
+                        remaining_circuits -= 1
+                        assigned_in_round = True
+                if not assigned_in_round:
+                    break
+
+            cursor = 0
             for mppt_num in range(1, mppts_per_inverter + 1):
-                bucket_size = base_size + (1 if mppt_num <= remainder else 0)
-                bucket_size = min(bucket_size, inputs_per_mppt)  # respetar cap.
-                for _ in range(bucket_size):
+                for _ in range(bucket_sizes[mppt_num - 1]):
                     if cursor < actual_count:
                         mppt_buckets[mppt_num].append(group[cursor])
                         cursor += 1
 
             # 3.4 Generar filas de salida con nomenclatura
             for mppt_num in range(1, mppts_per_inverter + 1):
+                prev_capacities = sum(inputs_per_mppt[:mppt_num-1])
                 for slot_idx, item in enumerate(mppt_buckets[mppt_num]):
-                    global_pv_num = (mppt_num - 1) * inputs_per_mppt + (slot_idx + 1)
+                    global_pv_num = prev_capacities + (slot_idx + 1)
                     pv_name = f"PV{global_pv_num:02d}"
                     nuevo_codigo = f"{item['Codigo_Circuito']}-{pv_name}"
 
@@ -394,6 +421,20 @@ class StandaloneMPPTAllocator:
                         "V Final (V)":       round(item["V_final"], 4),
                         "Error":             error_msg,
                     })
+            
+            # 3.5 Circuitos no asignados (exceso de capacidad)
+            while cursor < actual_count:
+                item = group[cursor]
+                final_rows.append({
+                    "Inversor (Padre)":  parent_id,
+                    "MPPT":              None,
+                    "Input_PV":          "UNASSIGNED",
+                    "Circuito Original": item["Codigo_Circuito"],
+                    "Nuevo Código":      f"{item['Codigo_Circuito']}-UNASSIGNED",
+                    "V Final (V)":       round(item["V_final"], 4),
+                    "Error":             error_msg,
+                })
+                cursor += 1
 
         return pd.DataFrame(final_rows)
 
