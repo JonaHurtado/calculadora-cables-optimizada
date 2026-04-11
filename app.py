@@ -753,26 +753,45 @@ with st.expander("💶 Editar precios por metro de conductor unipolar", expanded
 st.header("6. Configuración Fase E (MPPTs)")
 st.info("Configura la asignación automática de MPPTs que se ejecutará tras la optimización.")
 
-col_e1, col_e2, col_e3 = st.columns(3)
+col_e1, col_e2 = st.columns(2)
 with col_e1:
     pe_target_level = st.number_input("Nivel a Optimizar (Strings)", min_value=1, max_value=5, value=num_levels)
 with col_e2:
-    pe_n_mppts = st.number_input("Nº MPPTs por Inversor", min_value=1, value=6)
-with col_e3:
-    pe_n_inputs = st.number_input("Entradas por MPPT", min_value=1, value=5)
+    pe_n_mppts = st.number_input("Nº MPPTs por Inversor", min_value=1, value=6, key="pe_n_mppts_ui")
+
+# Configurar número de entradas por cada MPPT
+if 'pe_mppt_capacities' not in st.session_state or len(st.session_state['pe_mppt_capacities']) != pe_n_mppts:
+    st.session_state['pe_mppt_capacities'] = [{"MPPT": i+1, "Entradas Máximas": 6} for i in range(pe_n_mppts)]
+
+st.write("Capacidad por MPPT (Editable):")
+pe_edited_caps = st.data_editor(
+    pd.DataFrame(st.session_state['pe_mppt_capacities']),
+    hide_index=True,
+    use_container_width=True,
+    key="pe_mppt_editor"
+)
+st.session_state['pe_mppt_capacities'] = pe_edited_caps.to_dict('records')
+pe_inputs_list = [int(row["Entradas Máximas"]) for row in st.session_state['pe_mppt_capacities']]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# --- 8. MODO DE EJECUCIÓN: Tabs ---
-# Tab 1 → Flujo completo (sin cambios)
-# Tab 2 → Ejecución aislada Solo Fase E
+# --- 8. MODO DE EJECUCIÓN: Navegación Persistente ---
+# Usamos st.radio horizontal en lugar de st.tabs para evitar el reset al interactuar.
 # ─────────────────────────────────────────────────────────────────────────────
 
-tab1, tab2 = st.tabs(["⚡ Flujo Completo (Pasos 1-6)", "🔌 Solo Fase E (MPPTs)"])
+st.markdown("---")
+st.subheader("⚙️ Seleccionar Modo de Resultados / Ejecución")
+selected_mode = st.radio(
+    "Modo de trabajo:",
+    ["⚡ Flujo Completo (Pasos 1-6)", "🔌 Solo Fase E (MPPTs)"],
+    horizontal=True,
+    key="active_navigation_mode",
+    label_visibility="collapsed"
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — FLUJO COMPLETO (código original sin modificar)
+# OPCIÓN 1 — FLUJO COMPLETO
 # ══════════════════════════════════════════════════════════════════════════════
-with tab1:
+if selected_mode == "⚡ Flujo Completo (Pasos 1-6)":
     st.header("7. Resultados")
 
     if st.button("🚀 CALCULAR OPTIMIZACIÓN", type="primary", key="btn_full_run"):
@@ -897,7 +916,7 @@ with tab1:
                     # --- AUTOMATIC PHASE E EXECUTION ---
                     try:
                         allocator = MPPTAllocator(engine_v2, result_v2, ctx)
-                        df_phase_e = allocator.allocate(int(pe_target_level), int(pe_n_mppts), int(pe_n_inputs))
+                        df_phase_e = allocator.allocate(int(pe_target_level), pe_inputs_list)
                         st.session_state['phase_e_data'] = df_phase_e
                     except Exception as e_ph:
                         st.session_state['phase_e_data'] = None
@@ -988,13 +1007,13 @@ with tab1:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — SOLO FASE E (ejecución aislada, sin optimización previa)
+# OPCIÓN 2 — SOLO FASE E
 # ══════════════════════════════════════════════════════════════════════════════
-with tab2:
+else:
     st.header("Ejecución Aislada: Solo Fase E (MPPTs)")
     st.info(
         "Este modo permite asignar MPPTs **sin ejecutar la optimización completa**. "
-        "Solo debes proporcionar un Excel con los circuitos y su caída de tensión final."
+        "Solo debes proporcionar un Excel con los circuitos y su tensión final (V_final)."
     )
 
     # ── Guía del formato + plantilla descargable ──────────────────────────────
@@ -1004,15 +1023,11 @@ with tab2:
 
         | Columna | Tipo | Requerido | Descripción |
         | :--- | :---: | :---: | :--- |
-        | **`Codigo_Circuito`** | `str` | ✅ Sí | ID único del circuito/string. El **nivel se infiere automáticamente** contando los segmentos separados por guión: `INV01` = Nivel 1, `INV01-S01` = Nivel 2, `INV01-S01-X` = Nivel 3. El primer segmento es el inversor padre. |
-        | **`V_final`** | `float` | ✅ Sí | **Tensión final en bornes del inversor/MPPT**, en Voltios (V). Es el valor ya calculado: `V_nominal − Caída_de_tensión`. Se usa para ordenar strings y minimizar el mismatch entre los que comparten MPPT. |
-
-        > **Ventaja:** No hace falta una columna extra de nivel. Puedes incluir circuitos de
-        > todos los niveles de tu proyecto en un mismo Excel — el selector de la interfaz
-        > filtra automáticamente los del nivel que quieras procesar.
+        | **`Codigo_Circuito`** | `str` | ✅ Sí | ID único del circuito/string. El **nivel se infiere automáticamente** contando los segmentos separados por guión: `INV01` = Nivel 1, `INV01-S01` = Nivel 2, `INV01-S01-X` = Nivel 3. |
+        | **`V_final`** | `float` | ✅ Sí | **Tensión final en bornes del inversor/MPPT**, en Voltios (V). |
 
         > **Nota sobre `V_final`:** No es la caída de tensión, sino la tensión resultante.
-        > Ej: `V_nominal = 800 V`, caída = `12.5 V` → `V_final = 787.5 V`.
+        > Ej: `V_nominal = 800 V`, caída = `12.5 V` → `V_final = 787.5 V`.
         """)
 
         col_g1, col_g2 = st.columns([2, 1])
@@ -1050,7 +1065,7 @@ with tab2:
 
     # ── Configuración de Fase E Standalone ───────────────────────────────────
     st.subheader("2. Configuración MPPT")
-    col_se1, col_se2, col_se3 = st.columns(3)
+    col_se1, col_se2 = st.columns(2)
     with col_se1:
         se_nivel = st.number_input(
             "Nivel de circuitos a procesar",
@@ -1059,27 +1074,23 @@ with tab2:
             value=2,
             step=1,
             key="se_nivel",
-            help=(
-                "Selecciona el nivel jerárquico de los circuitos que quieres asignar a MPPTs. "
-                "El nivel se infiere automáticamente del código: "
-                "'INV01' = Nivel 1, 'INV01-S01' = Nivel 2, 'INV01-S01-X' = Nivel 3. "
-                "Solo se procesarán los circuitos cuyo código tenga ese número de segmentos."
-            )
+            help="Selecciona el nivel jerárquico de los circuitos que quieres asignar a MPPTs."
         )
     with col_se2:
-        se_n_mppts = st.number_input(
-            "Nº MPPTs por Inversor",
-            min_value=1,
-            value=6,
-            key="se_n_mppts"
-        )
-    with col_se3:
-        se_n_inputs = st.number_input(
-            "Entradas por MPPT",
-            min_value=1,
-            value=5,
-            key="se_n_inputs"
-        )
+        se_n_mppts = st.number_input("Nº MPPTs por Inversor", min_value=1, value=6, key="se_n_mppts")
+
+    if 'se_mppt_capacities' not in st.session_state or len(st.session_state['se_mppt_capacities']) != se_n_mppts:
+        st.session_state['se_mppt_capacities'] = [{"MPPT": i+1, "Entradas Máximas": 6} for i in range(se_n_mppts)]
+
+    st.write("Capacidad por MPPT (Editable):")
+    se_edited_caps = st.data_editor(
+        pd.DataFrame(st.session_state['se_mppt_capacities']),
+        hide_index=True,
+        use_container_width=True,
+        key="se_mppt_editor"
+    )
+    st.session_state['se_mppt_capacities'] = se_edited_caps.to_dict('records')
+    se_inputs_list = [int(row["Entradas Máximas"]) for row in st.session_state['se_mppt_capacities']]
 
     st.markdown("---")
 
@@ -1094,31 +1105,21 @@ with tab2:
                 # 1. Leer el Excel
                 df_input_fase_e = pd.read_excel(uploaded_fase_e)
 
-                # 2. Instanciar el allocator (valida columnas y tipos internamente)
-                allocator_standalone = StandaloneMPPTAllocator(
-                    df_input=df_input_fase_e
-                )
+                # 2. Instanciar el allocator
+                allocator_standalone = StandaloneMPPTAllocator(df_input=df_input_fase_e)
 
-                # 3. Ejecutar la asignación filtrando por el nivel seleccionado
+                # 3. Ejecutar la asignación
                 with st.spinner("⚙️ Calculando asignación de MPPTs..."):
                     df_resultado_se = allocator_standalone.allocate(
                         nivel=int(se_nivel),
-                        mppts_per_inverter=int(se_n_mppts),
-                        inputs_per_mppt=int(se_n_inputs)
+                        inputs_per_mppt=se_inputs_list
                     )
 
-                # 4. Construir el Excel de salida: copia del input + columnas MPPT e Input_PV
-                #    Solo se rellena para los circuitos del nivel procesado.
+                # 4. Construir el Excel de salida enriquecido
                 df_enriquecido = df_input_fase_e.copy()
+                mppt_map = df_resultado_se.set_index('Circuito Original')[['MPPT', 'Input_PV']].to_dict('index')
 
-                # Mapa código → (MPPT, Input_PV) desde el resultado
-                mppt_map = (
-                    df_resultado_se
-                    .set_index('Circuito Original')[['MPPT', 'Input_PV']]
-                    .to_dict('index')
-                )
-
-                df_enriquecido['MPPT']     = df_enriquecido['Codigo_Circuito'].map(
+                df_enriquecido['MPPT'] = df_enriquecido['Codigo_Circuito'].map(
                     lambda c: mppt_map.get(c, {}).get('MPPT', None)
                 )
                 df_enriquecido['Input_PV'] = df_enriquecido['Codigo_Circuito'].map(
@@ -1131,15 +1132,9 @@ with tab2:
                 st.session_state['solo_fase_e_done']        = True
                 st.session_state['solo_fase_e_filename']    = uploaded_fase_e.name
 
-            except (ValueError, TypeError) as ve:
-                # Errores de validación del formato del Excel
-                st.session_state['solo_fase_e_done'] = False
-                st.error(f"❌ **Error de formato en el Excel:**\n\n{ve}")
             except Exception as exc:
                 st.session_state['solo_fase_e_done'] = False
-                st.error(f"❌ Error inesperado: {exc}")
-                import traceback
-                st.code(traceback.format_exc())
+                st.error(f"❌ Error: {exc}")
 
     # ── Resultados Fase E Standalone ──────────────────────────────────────────
     if st.session_state.get('solo_fase_e_done', False):
@@ -1148,62 +1143,40 @@ with tab2:
 
         st.markdown("---")
         st.subheader("4. Resultados: Asignación de MPPTs")
+        
+        # LEDs de estado
+        if 'Error' in df_se.columns:
+            errors_se = df_se[df_se['Error'] != 'OK']
+            if not errors_se.empty:
+                st.error(f"⚠️ {len(errors_se)} circuito(s) exceden capacidad.")
+                with st.expander("Ver detalles de errores"):
+                    st.dataframe(errors_se, use_container_width=True)
+            else:
+                st.success("✅ Asignación MPPT correcta.")
 
-        if df_se.empty:
-            st.warning("⚠️ El allocator no encontró circuitos en el archivo cargado.")
-        else:
-            # Resumen de errores de capacidad
-            if 'Error' in df_se.columns:
-                errors_se = df_se[df_se['Error'] != 'OK']
-                if not errors_se.empty:
-                    st.error(
-                        f"⚠️ {len(errors_se)} circuito(s) exceden la capacidad del inversor. "
-                        "Revisa los grupos señalados."
-                    )
-                    with st.expander("Ver circuitos con error"):
-                        st.dataframe(
-                            errors_se[['Inversor (Padre)', 'Circuito Original', 'Error']].drop_duplicates(),
-                            use_container_width=True
-                        )
-                else:
-                    st.success("✅ Asignación MPPT correcta — Sin errores de capacidad.")
+        # KPIs
+        n_inversores = df_se['Inversor (Padre)'].nunique()
+        n_circuitos  = df_se['Circuito Original'].nunique()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Inversores", n_inversores)
+        c2.metric("Circuitos", n_circuitos)
+        c3.metric("MPPTs", int(se_n_mppts))
 
-            # KPIs rápidos
-            n_inversores = df_se['Inversor (Padre)'].nunique()
-            n_circuitos  = df_se['Circuito Original'].nunique()
-            col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
-            col_kpi1.metric("Inversores procesados", n_inversores)
-            col_kpi2.metric("Circuitos asignados",   n_circuitos)
-            col_kpi3.metric("MPPTs configurados",    int(se_n_mppts))
+        # Tabla y descarga
+        st.caption("👇 Vista previa del Excel de salida (enriquecido)")
+        st.dataframe(df_enriquecido, use_container_width=True, hide_index=True)
 
-            # Tabla principal: Excel de entrada enriquecido con MPPT e Input_PV
-            st.caption(
-                "👇 Mismo formato que el Excel de salida: todas las filas del input "
-                "+ columnas **MPPT** e **Input_PV** en los circuitos del nivel procesado."
-            )
-            st.dataframe(df_enriquecido, use_container_width=True, hide_index=True)
-
-            # Detalle de la asignación (colapsable)
-            with st.expander("🔍 Ver tabla de asignación completa"):
-                st.dataframe(df_se, use_container_width=True, hide_index=True)
-
-            # ── Descarga del Excel de salida ──────────────────────────────────
-            # Formato: mismo que el input + columnas MPPT e Input_PV
-            # Nombre:  {nombre_original}_MPPT.xlsx
-            nombre_base = os.path.splitext(st.session_state['solo_fase_e_filename'])[0]
-            out_se_name = f"{nombre_base}_MPPT.xlsx"
-
-            excel_se_buf = io.BytesIO()
-            with pd.ExcelWriter(excel_se_buf, engine='openpyxl') as writer:
-                df_enriquecido.to_excel(writer, sheet_name="Datos_MPPT", index=False)
-            excel_se_buf.seek(0)
-
-            st.download_button(
-                label="📥 Descargar Excel con MPPTs asignados",
-                data=excel_se_buf.getvalue(),
-                file_name=out_se_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="btn_download_fase_e_result"
-            )
-            st.caption(f"📄 Archivo de salida: **{out_se_name}**")
+        nombre_base = os.path.splitext(st.session_state['solo_fase_e_filename'])[0]
+        out_se_name = f"{nombre_base}_MPPT.xlsx"
+        
+        excel_se_buf = io.BytesIO()
+        with pd.ExcelWriter(excel_se_buf, engine='openpyxl') as writer:
+            df_enriquecido.to_excel(writer, sheet_name="Datos_MPPT", index=False)
+        
+        st.download_button(
+            label="📥 Descargar Excel con MPPTs asignados",
+            data=excel_se_buf.getvalue(),
+            file_name=out_se_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
