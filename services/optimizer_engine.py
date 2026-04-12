@@ -1,4 +1,4 @@
-﻿"""
+"""
 Optimizer Engine - Main orchestrator for cable optimization.
 
 This service coordinates Excel loading, circuit tree building,
@@ -74,7 +74,14 @@ class OptimizerEngine:
         if not all(col in df.columns for col in required):
             print(f"[ERROR] Missing required columns. Need: {required}")
             return False
-        
+            
+        # --- Lógica de Método IEC ---
+        metodo_col = next((c for c in df.columns if c.lower() in ['metodo_iec', 'metodo iec', 'método iec', 'método_iec']), None)
+        if metodo_col:
+            df['is_enterrado'] = df[metodo_col].astype(str).str.strip().str.upper().isin(["D1", "D2"])
+        else:
+            df['is_enterrado'] = False
+            
         # Parse circuits from Excel
         temp = {}
         for _, row in df.iterrows():
@@ -125,7 +132,8 @@ class OptimizerEngine:
                     voltage_specific=voltage_spec,
                     initial_conductors=init_conductors,
                     temperature_specific=temperature_spec,
-                    derating_factor=derating_spec
+                    derating_factor=derating_spec,
+                    is_enterrado=bool(row.get('is_enterrado', False))
                 )
                 
                 temp[circuit.code] = circuit
