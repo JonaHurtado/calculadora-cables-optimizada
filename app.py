@@ -820,8 +820,11 @@ if selected_mode == "⚡ Flujo Completo (Pasos 1-6)":
     st.header("7. Resultados")
 
     if st.button("🚀 CALCULAR OPTIMIZACIÓN", type="primary", key="btn_full_run"):
-        if uploaded_file is None or not st.session_state['rules_list']:
-            st.error("⚠️ Faltan datos: Por favor carga el Excel y define al menos una regla.")
+        # Check for rules in both standard (Step 3) and advanced (Step 4) sections
+        has_rules = len(st.session_state.get('rules_list', [])) > 0 or len(st.session_state.get('parsed_advanced_rules', [])) > 0
+        
+        if uploaded_file is None or not has_rules:
+            st.error("⚠️ Faltan datos: Por favor carga el Excel y define al menos una regla (estándar o avanzada).")
         else:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
                 tmp_file.write(uploaded_file.getvalue())
