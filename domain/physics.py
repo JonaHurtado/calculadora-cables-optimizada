@@ -382,6 +382,47 @@ def calculate_circuit_voltage_drop(
     return (vd_volts, vd_percent)
 
 
+def get_effective_conductor_temperature(
+    circuit: 'Circuit',
+    section: float,
+    n_cond: int,
+    context: 'OptimizationContext'
+) -> float:
+    """
+    Get effective conductor temperature (static or dynamic).
+    """
+    t_cond = circuit.temperature_specific if circuit.temperature_specific is not None else context.temperature
+    
+    if circuit.level in context.level_ampacities:
+        amp_map = context.level_ampacities[circuit.level]
+        if section in amp_map:
+            # amp_map[section] is now a dict with 'aereo' and 'enterrado'
+            iz_choice = amp_map[section]
+            if circuit.is_enterrado:
+                iz_base = iz_choice.get('enterrado', 0.0)
+                t_ref = context.level_t_ref_suelo.get(circuit.level, 25.0)
+            else:
+                iz_base = iz_choice.get('aereo', 0.0)
+                t_ref = context.level_t_ref_aire.get(circuit.level, 40.0)
+            
+            t_max = context.level_t_max.get(circuit.level, 90.0)
+            
+            # Utilizar 1.0 si no hay factor de agrupamiento definido
+            derating = circuit.derating_factor if (circuit.derating_factor is not None and circuit.derating_factor > 0) else 1.0
+            
+            current_per_cond = circuit.current / n_cond
+            t_cond_dyn = calculate_conductor_temperature(
+                i_design=current_per_cond,
+                iz_base=iz_base,
+                derating_factor=derating,
+                t_ref=t_ref,
+                t_max=t_max
+            )
+            t_cond = t_cond_dyn
+            
+    return t_cond
+
+
 def get_detailed_electrical_params(
     circuit: 'Circuit',
     candidate: Tuple[float, int],
@@ -417,35 +458,7 @@ def get_detailed_electrical_params(
     props = cable_catalog.get_properties(section, circuit.conductor_type)
     r_20 = props.r_ohm_km
     
-    t_cond = circuit.temperature_specific if circuit.temperature_specific is not None else context.temperature
-    
-    # Dynamic Temperature Calculation (if enabled)
-    # Check if we have necessary data: derating_factor in circuit AND ampacities in context
-    if (circuit.derating_factor is not None and 
-        circuit.derating_factor > 0 and 
-        circuit.level in context.level_ampacities):
-        
-        amp_map = context.level_ampacities[circuit.level]
-        if section in amp_map:
-            iz_base = amp_map[section]
-            t_ref = context.level_t_ref.get(circuit.level, 20.0)
-            t_max = context.level_t_max.get(circuit.level, 90.0)
-            
-            # Calculate dynamic temperature
-            # Current is total circuit current.
-            # We must account for parallel conductors: Current per conductor = Total / n_cond
-            current_per_cond = circuit.current / n_cond
-            
-            t_cond_dyn = calculate_conductor_temperature(
-                i_design=current_per_cond,
-                iz_base=iz_base,
-                derating_factor=circuit.derating_factor,
-                t_ref=t_ref,
-                t_max=t_max
-            )
-            
-            # Override t_cond
-            t_cond = t_cond_dyn
+    t_cond = get_effective_conductor_temperature(circuit, section, n_cond, context)
     
     # Calculate resistance at operating temperature
     r_tcond_single = calculate_resistance_at_temperature(r_20, circuit.conductor_type, t_cond)

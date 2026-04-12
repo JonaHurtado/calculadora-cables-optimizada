@@ -143,7 +143,8 @@ class Circuit:
         voltage_specific: Optional[float] = None,
         initial_conductors: int = 1,
         temperature_specific: Optional[float] = None,
-        derating_factor: Optional[float] = None
+        derating_factor: Optional[float] = None,
+        is_enterrado: bool = False
     ):
         """
         Initialize a Circuit instance.
@@ -167,6 +168,7 @@ class Circuit:
         self.initial_conductors = initial_conductors
         self.temperature_specific = temperature_specific
         self.derating_factor = derating_factor
+        self.is_enterrado = is_enterrado
         
         # Hierarchy relationships
         self.parent: Optional[Circuit] = None
@@ -269,8 +271,9 @@ class OptimizationContext:
     level_allowed_sections: Dict[int, List[float]]
     level_allow_double: Dict[int, List[float]]
     derating_factor: Optional[float] = None
-    level_ampacities: Dict[int, Dict[float, float]] = field(default_factory=dict)
-    level_t_ref: Dict[int, float] = field(default_factory=dict)
+    level_ampacities: Dict[int, Dict[float, Dict[str, float]]] = field(default_factory=dict)
+    level_t_ref_suelo: Dict[int, float] = field(default_factory=dict)
+    level_t_ref_aire: Dict[int, float] = field(default_factory=dict)
     level_t_max: Dict[int, float] = field(default_factory=dict)
     rules: List['BaseRule'] = field(default_factory=list)
     cable_catalog: CableCatalog = field(default_factory=lambda: CableCatalog({}, {}))
