@@ -269,7 +269,7 @@ coste total posible, optimizando la inversión en materiales.
 # --- 3. SIDEBAR ---
 with st.sidebar:
     st.header("Configuración Global")
-    temp_global = st.number_input("Temperatura del Conductor (°C)", min_value=0.0, value=90.0, step=5.0)
+    temp_global = st.number_input("Temperatura del Conductor MAX (°C)", min_value=0.0, value=90.0, step=5.0)
     
     st.markdown("---")
     num_levels = st.number_input("¿Cuántos niveles de profundidad tiene el proyecto?", min_value=1, max_value=5, value=3)
@@ -305,7 +305,8 @@ def generate_excel_template():
         "Corriente": [630.0, 400.0, 63.0],
         "Voltaje": [None, None, 1100.0],
         "Temperatura": [None, 90.0, None],
-        "K_agrup": [None, 0.8, None]
+        "K_agrup": [None, 0.8, None],
+        "metodo_iec": ["D1", "E", "D2"]
     })
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -366,6 +367,7 @@ with st.expander("📂 Ver formato de archivo Excel requerido", expanded=False):
     | **Voltaje** | ℹ️ Opt | Voltaje específico del circuito (V). Sobrescribe el valor del nivel. |
     | **Temperatura** | ℹ️ Opt | Temperatura de diseño (°C). Sobrescribe la global. |
     | **K_agrup** | ℹ️ Opt | Coeficiente de reducción (Derating factor). *Solo si se usa temp. dinámica.* |
+    | **metodo_iec** | ℹ️ Opt | Método de instalación (ej: `D1`, `D2`, `E`, `F`). Define temp. de referencia. |
 
     > [!TIP]
     > **Jerarquía por Código:** El optimizador asume que `C1-1` es "hijo" de `C1`. Si un padre no existe físicamente, se creará un nodo virtual automáticamente.
@@ -386,7 +388,7 @@ with st.expander("📂 Ver formato de archivo Excel requerido", expanded=False):
     
     st.dataframe(pd.DataFrame({
         "Código": ["C1", "C1-1"], "Longitud": [150.0, 30.0],
-        "Sección Mínima": ["2x240", 16.0], "Tipo de Conductor": ["Al", "Cu"], "Corriente": [630.0, 63.0]
+        "Sección Mínima": ["2x240", 16.0], "Tipo de Conductor": ["Al", "Cu"], "Corriente": [630.0, 63.0], "metodo_iec": ["D1", "E"]
     }), hide_index=True, use_container_width=True)
 
 uploaded_file = st.file_uploader("Sube tu archivo Excel", type=["xlsx"])
@@ -423,7 +425,8 @@ config_niveles = {
     "voltages": {}, "systems_ui": {}, "factors": {},
     "frequencies": {}, "disposiciones": {}, "allowed_sections": {},
     "allow_double": {},
-    "level_t_ref": {},
+    "level_t_ref_suelo": {},
+    "level_t_ref_aire": {},
     "level_t_max": {},
     "level_ampacities": {}
 }
@@ -497,28 +500,47 @@ for i, tab in enumerate(tabs):
             )
             
             if use_dyn_temp:
-                c_t1, c_t2 = st.columns(2)
+                st.info('**Configuración de Métodos IEC:** El sistema detecta automáticamente el tipo de instalación. Los métodos **D1 y D2** se calculan como "Enterrados" usando su temperatura de referencia (Suelo). Cualquier otro método introducido en el Excel será tratado como "Aéreo".')
+                c_t1, c_t2, c_t3 = st.columns(3)
                 with c_t1:
-                    t_ref_val = st.number_input(f"Temp. Referencia/Suelo (ºC) - N{lvl}", value=20.0, step=1.0)
-                    config_niveles["level_t_ref"][lvl] = t_ref_val
+                    t_ref_suelo_val = st.number_input(f"Temp. Ref./Suelo (ºC) - N{lvl}", value=20.0, step=1.0)
+                    config_niveles["level_t_ref_suelo"][lvl] = t_ref_suelo_val
                 with c_t2:
+                    t_ref_aire_val = st.number_input(f"Temp. Ref./Aire (ºC) - N{lvl}", value=40.0, step=1.0)
+                    config_niveles["level_t_ref_aire"][lvl] = t_ref_aire_val
+                with c_t3:
                     t_max_val = st.number_input(f"Temp. Máx. Aislamiento (ºC) - N{lvl}", value=90.0, step=1.0)
                     config_niveles["level_t_max"][lvl] = t_max_val
                 
                 st.caption("Tabla de Ampacidades (Iz Base) para Secciones Permitidas:")
                 
-                # Default Ampacities (approximate standard values for reference)
-                default_amps_map = {
-                    4.0: 43.0, 6.0: 53.0, 10.0: 71.0, 16.0: 91.0, 25.0: 108.0, 35.0: 135.0,
-                    50.0: 168.0, 70.0: 207.0, 95.0: 250.0, 120.0: 292.0, 150.0: 335.0,
-                    185.0: 382.0, 240.0: 453.0, 300.0: 504.0, 400.0: 590.0, 500.0: 660.0, 630.0: 760.0,
-                    1.5: 23.0, 2.5: 32.0 
+                # Default Ampacities Split by Installation Method (Requirement 2)
+                # Hardcoded defaults:
+                # 4 mm² → Aéreo: 45 A | Enterrado: 43 A
+                # 6 mm² → Aéreo: 58 A | Enterrado: 53 A
+                # 10 mm² → Aéreo: 80 A | Enterrado: 71 A
+                # 240 mm² → Aéreo: 530 A | Enterrado: 343 A
+                # 300 mm² → Aéreo: 613 A | Enterrado: 386 A
+                # 400 mm² → Aéreo: 740 A | Enterrado: 441 A
+                
+                defaults_split = {
+                    4.0: {"Aéreo": 45.0, "Enterrado": 43.0},
+                    6.0: {"Aéreo": 58.0, "Enterrado": 53.0},
+                    10.0: {"Aéreo": 80.0, "Enterrado": 71.0},
+                    240.0: {"Aéreo": 530.0, "Enterrado": 343.0},
+                    300.0: {"Aéreo": 613.0, "Enterrado": 386.0},
+                    400.0: {"Aéreo": 740.0, "Enterrado": 441.0},
                 }
                 
                 # Filter for allowed sections only
                 amp_data = []
                 for s in sorted(current_allowed):
-                    amp_data.append({"Sección": s, "Ampacidad (Iz)": default_amps_map.get(s, 0.0)})
+                    d = defaults_split.get(s, {"Aéreo": 0.0, "Enterrado": 0.0})
+                    amp_data.append({
+                        "Sección": s, 
+                        "Ampacidad Aéreo [A]": d["Aéreo"],
+                        "Ampacidad Enterrado [A]": d["Enterrado"]
+                    })
                 
                 edited_amps = st.data_editor(
                     pd.DataFrame(amp_data),
@@ -527,10 +549,13 @@ for i, tab in enumerate(tabs):
                     key=f"editor_amps_n{lvl}"
                 )
                 
-                # Convert back to dict
+                # Convert back to dict with nested structure: {section: {'aereo': X, 'enterrado': Y}}
                 lvl_amp_dict = {}
                 for idx, row in edited_amps.iterrows():
-                    lvl_amp_dict[row["Sección"]] = row["Ampacidad (Iz)"]
+                    lvl_amp_dict[row["Sección"]] = {
+                        "aereo": row["Ampacidad Aéreo [A]"],
+                        "enterrado": row["Ampacidad Enterrado [A]"]
+                    }
                 config_niveles["level_ampacities"][lvl] = lvl_amp_dict
 
 # --- 6. RULES MANAGER ---
@@ -847,7 +872,8 @@ if selected_mode == "⚡ Flujo Completo (Pasos 1-6)":
                     config_niveles["allow_double"],
                     None, # derating_factor (unused in context, kept for compatibility if needed)
                     config_niveles["level_ampacities"],
-                    config_niveles["level_t_ref"],
+                    config_niveles["level_t_ref_suelo"],
+                    config_niveles["level_t_ref_aire"],
                     config_niveles["level_t_max"],
                     final_rules,
                     raw_catalog
@@ -888,8 +914,35 @@ if selected_mode == "⚡ Flujo Completo (Pasos 1-6)":
                         st.error("No se pudieron cargar o validar los datos del Excel.")
                         results["v2"] = (None, None, 0.0)
                     else:
-                        status.update(label="⚡ Ejecutando algoritmo BFTB...")
-                        st.write(f"Optimizando {len(engine.circuits)} circuitos...")
+                        # Requirement 4: Validation of Ampacities before simulation
+                        invalid_circuits = []
+                        for code, circuit in engine.circuits.items():
+                            if circuit.level in ctx.level_ampacities:
+                                # For this circuit's level, check if it has the required ampacity for its method
+                                # We check the allowed sections because the optimizer will try them
+                                amp_map = ctx.level_ampacities[circuit.level]
+                                method_key = "enterrado" if circuit.is_enterrado else "aereo"
+                                method_label = "Enterrado" if circuit.is_enterrado else "Aéreo"
+                                
+                                # Check the minimum section and all other allowed sections
+                                # because the optimizer will iterate over candidates
+                                for section, n_cond in engine.candidate_lists.get(circuit.level, []):
+                                    iz_vals = amp_map.get(section, {})
+                                    val = iz_vals.get(method_key, 0.0)
+                                    if val <= 0:
+                                        invalid_circuits.append(
+                                            f"Circuito {code} (N{circuit.level}): Falta ampacidad {method_label} para sección {section} mm²"
+                                        )
+                        
+                        if invalid_circuits:
+                            status.update(label="❌ Validación fallida", state="error", expanded=True)
+                            st.error("### ⚠️ Faltan Ampacidades Base\n" + "\n".join([f"- {m}" for m in list(set(invalid_circuits))[:10]]))
+                            if len(invalid_circuits) > 10:
+                                st.write(f"... y {len(invalid_circuits)-10} errores más.")
+                            results["v2"] = (None, None, 0.0)
+                        else:
+                            status.update(label="⚡ Ejecutando algoritmo BFTB...")
+                            st.write(f"Optimizando {len(engine.circuits)} circuitos...")
                         
                         start_time = time.time()
                         result = engine.solve()
