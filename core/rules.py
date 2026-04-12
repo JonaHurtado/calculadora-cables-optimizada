@@ -18,7 +18,7 @@ import ast
 import re
 
 from domain.models import Circuit, OptimizationContext
-from domain.physics import calculate_circuit_voltage_drop
+from domain.physics import calculate_circuit_voltage_drop, get_effective_conductor_temperature
 from data.repository import CableRepository
 
 
@@ -105,7 +105,7 @@ def calculate_vd_percent(
         cos_phi = context.power_factors.get(circuit.level, 1.0)
         frequency = context.frecuencia.get(circuit.level, 50.0)
         layout = context.disposicion.get(circuit.level, 'Plana')
-        temperature = context.get_level_temperature(circuit)
+        temperature = get_effective_conductor_temperature(circuit, section, n_conductors, context)
     except KeyError:
         return 0.0
     

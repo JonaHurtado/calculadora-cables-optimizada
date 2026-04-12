@@ -9,7 +9,7 @@ from collections import defaultdict
 import time
 
 from domain.models import Circuit, OptimizationContext, OptimizationResult
-from domain.physics import calculate_circuit_voltage_drop, calculate_conductor_temperature
+from domain.physics import calculate_circuit_voltage_drop, calculate_conductor_temperature, get_effective_conductor_temperature
 from data.repository import CableRepository
 from core.rules import (
     BaseRule, IntraLevelRule, LocalSubgroupRule,
@@ -138,41 +138,11 @@ class BFTBStrategy(IOptimizationStrategy):
                 self._vd_matrix[circuit.code] = {}
                 self._cost_matrix[circuit.code] = {}
                 
-                # Get circuit-specific temp (baseline)
-                # If dynamic temp is enabled, this will be recalculated per candidate
-                base_temp = self.context.get_level_temperature(circuit)
-                
-                # Check for dynamic temp requirements
-                use_dynamic_temp = False
-                amp_map = {}
-                t_ref = 20.0
-                t_max = 90.0
-                
-                if (circuit.derating_factor is not None and 
-                    circuit.derating_factor > 0 and 
-                    circuit.level in self.context.level_ampacities):
-                    use_dynamic_temp = True
-                    amp_map = self.context.level_ampacities[circuit.level]
-                    t_ref = self.context.level_t_ref.get(circuit.level, 20.0)
-                    t_max = self.context.level_t_max.get(circuit.level, 90.0)
-                
                 for cand in candidates:
                     section, n_cond = cand
                     
-                    # Determine temperature for this candidate
-                    if use_dynamic_temp and section in amp_map:
-                        iz_base = amp_map[section]
-                        current_per_cond = circuit.current / n_cond
-                        
-                        temp = calculate_conductor_temperature(
-                            i_design=current_per_cond,
-                            iz_base=iz_base,
-                            derating_factor=circuit.derating_factor,
-                            t_ref=t_ref,
-                            t_max=t_max
-                        )
-                    else:
-                        temp = base_temp
+                    # Determine temperature for this candidate using updated logic
+                    temp = get_effective_conductor_temperature(circuit, section, n_cond, self.context)
                     
                     # --- Cost Calculation ---
                     try:
@@ -295,7 +265,7 @@ class BFTBStrategy(IOptimizationStrategy):
         snapshot_inicial: Optional[Dict[str, Tuple[float, int]]] = None
     ) -> Dict[str, Tuple[float, int]]:
         
-        max_iterations = 1000
+        max_iterations = 20000
         iteration = 0
         
         while iteration < max_iterations:
@@ -308,62 +278,69 @@ class BFTBStrategy(IOptimizationStrategy):
             if not failing_info:
                 break
             
-            parent_circuit, gap = failing_info[0]
-            group_circuits = self._get_group_members(parent_circuit, rule)
+            best_circuit_overall = None
+            best_cand_overall = None
+            best_ratio_overall = -1.0
+            best_parent_overall = None
+            best_group_overall = None
             
-            if gap <= 0: break
+            for failing_item in failing_info:
+                parent_circuit, gap = failing_item
+                if gap <= 0: continue
+                
+                group_circuits = self._get_group_members(parent_circuit, rule)
+                
+                for circuit in group_circuits:
+                    curr_cand = sol[circuit.code]
+                    
+                    # Get candidates list and find current position
+                    cands = self.candidate_lists.get(circuit.level, [])
+                    try:
+                        curr_idx = cands.index(curr_cand)
+                    except ValueError:
+                        continue
+                    
+                    # Skip if already at max section
+                    if curr_idx >= len(cands) - 1:
+                        continue
+                    
+                    # Dynamic delta calculation from matrices (always correct)
+                    curr_vd = self._calc_vd(circuit, curr_cand)
+                    curr_cost = self._get_circuit_cost(circuit, curr_cand)
+                    
+                    # Evaluate ALL superior candidates (full search space)
+                    for i in range(curr_idx + 1, len(cands)):
+                        candidate = cands[i]
+                        
+                        delta_vd = curr_vd - self._calc_vd(circuit, candidate)
+                        if delta_vd <= 0: continue
+                        
+                        delta_cost = self._get_circuit_cost(circuit, candidate) - curr_cost
+                        is_double = candidate[1] > curr_cand[1]
+                        
+                        local_improvement = delta_vd
+                        actual_group_improvement = self._calculate_group_improvement(
+                            circuit, local_improvement, rule, parent_circuit, group_circuits
+                        )
+                        
+                        effective_improvement = min(actual_group_improvement, gap)
+                        safe_delta_cost = max(delta_cost, 0.001)
+                        
+                        ratio = effective_improvement / safe_delta_cost
+                        if is_double:
+                            ratio *= 0.10
+                        
+                        if ratio > best_ratio_overall:
+                            best_ratio_overall = ratio
+                            best_circuit_overall = circuit
+                            best_cand_overall = candidate
+                            best_parent_overall = parent_circuit
+                            best_group_overall = group_circuits
             
-            best_circuit = None
-            best_cand = None
-            best_ratio = -1.0
-            
-            for circuit in group_circuits:
-                curr_cand = sol[circuit.code]
-                
-                # Get candidates list and find current position
-                cands = self.candidate_lists.get(circuit.level, [])
-                try:
-                    curr_idx = cands.index(curr_cand)
-                except ValueError:
-                    continue
-                
-                # Skip if already at max section
-                if curr_idx >= len(cands) - 1:
-                    continue
-                
-                # Dynamic delta calculation from matrices (always correct)
-                curr_vd = self._calc_vd(circuit, curr_cand)
-                curr_cost = self._get_circuit_cost(circuit, curr_cand)
-                
-                # Evaluate ALL superior candidates (full search space)
-                for i in range(curr_idx + 1, len(cands)):
-                    candidate = cands[i]
-                    
-                    delta_vd = curr_vd - self._calc_vd(circuit, candidate)
-                    delta_cost = self._get_circuit_cost(circuit, candidate) - curr_cost
-                    is_double = candidate[1] > curr_cand[1]
-                    
-                    local_improvement = delta_vd
-                    actual_group_improvement = self._calculate_group_improvement(
-                        circuit, local_improvement, rule, parent_circuit, group_circuits
-                    )
-                    
-                    effective_improvement = min(actual_group_improvement, gap)
-                    safe_delta_cost = max(delta_cost, 0.001)
-                    
-                    ratio = effective_improvement / safe_delta_cost
-                    if is_double:
-                        ratio *= 0.10
-                    
-                    if ratio > best_ratio:
-                        best_ratio = ratio
-                        best_circuit = circuit
-                        best_cand = candidate
-            
-            if best_circuit and best_cand:
-                sol[best_circuit.code] = best_cand
-                if isinstance(rule, ParentChildSubgroupRule) and best_circuit == parent_circuit and snapshot_inicial:
-                    children = [c for c in group_circuits if c != parent_circuit]
+            if best_circuit_overall and best_cand_overall:
+                sol[best_circuit_overall.code] = best_cand_overall
+                if isinstance(rule, ParentChildSubgroupRule) and best_circuit_overall == best_parent_overall and snapshot_inicial:
+                    children = [c for c in best_group_overall if c != best_parent_overall]
                     for child in children:
                         if child.code in snapshot_inicial:
                             sol[child.code] = snapshot_inicial[child.code]
